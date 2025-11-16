@@ -1,0 +1,1436 @@
+"""
+Production-Ready PDF Extractor API - FIXED VERSION
+Handles concurrent requests, proper error handling, logging, and security
+Run with: gunicorn -w 4 -b 0.0.0.0:5000 --timeout 300 app:app
+
+FIXES:
+- Sr. No. no longer merges into description
+- Better detection of continuation rows
+- Improved serial number validation
+"""
+
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import camelot
+import pandas as pd
+import io
+import os
+import re
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+import easyocr
+from pdf2image import convert_from_bytes
+import numpy as np
+import traceback
+import json
+import logging
+from datetime import datetime
+from functools import wraps
+from werkzeug.utils import secure_filename
+import threading
+
+# ============================================================================
+# APP CONFIGURATION
+# ============================================================================
+
+app = Flask(__name__)
+
+# CORS - configure for production
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '*').split(',')
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ALLOWED_ORIGINS,
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization", "X-API-Key"],
+        "expose_headers": ["Content-Type", "Content-Disposition"]
+    }
+})
+
+# Configuration
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
+PORT = int(os.environ.get('PORT', 5000))
+API_KEY = os.environ.get('API_KEY', 'your-secret-api-key-change-in-production')
+ENABLE_API_KEY = os.environ.get('ENABLE_API_KEY', 'false').lower() == 'true'
+
+# Rate limiting - prevents abuse
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["500 per day", "100 per hour"],
+    storage_uri="memory://"
+)
+
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+
+log_dir = 'logs'
+os.makedirs(log_dir, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(log_dir, 'pdf_extractor.log')),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# CUSTOM JSON ENCODER
+# ============================================================================
+
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        if isinstance(obj, (np.floating, np.float64, np.float32)):
+            if np.isnan(obj) or np.isinf(obj):
+                return None
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if pd.isna(obj):
+            return None
+        return super(NumpyEncoder, self).default(obj)
+
+app.json_encoder = NumpyEncoder
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+UNIT_CONVERSIONS = {
+    "p-no/p hour": 1.0, "p-no": 1.0, "p no": 1.0, "p.no": 1.0,
+    "hour": 1.0, "hours": 1.0, "meters": 1.0, "kilometers": 1000.0,
+    "each": 1.0, "lot": 1.0, "kgs": 1.0, "tons": 1000.0,
+    "liters": 1.0, "gallons": 3.785, "days": 8.0, "nos": 1.0,
+    "pc": 1.0, "set": 1.0, "%": 100.0, "%0": 1000.0, "%o": 1000.0,
+    "% 0": 1000.0, "% o": 1000.0, "sqm": 1.0, "cum": 1.0, "lm": 1.0,
+}
+
+PDF_COLUMN_MAPPING_RULES = {
+    "Sr No.": {
+        "keywords": ["sr.no", "sr no.", "sr no", "sr. no", "sr. no.", "seriel number", "srno", "s.no",
+                    "serial no", "serial number", "sr.", "no.", "sno", "s. no", "srl no", "item no", 
+                    "idx", "index", "chap no", "sl no", "s.l.no", "sl.no", "s.no", "sr .no"]
+    },
+    "Items Description": {
+        "keywords": ["item name", "itemname", "item-name", "item_name", "items", "item description", 
+                    "items description", "item desc", "description", "description of item", "desc", 
+                    "particulars", "details", "material description", "scope of work", "work description", 
+                    "narration", "item details", "particuler of item", "particular", "specifications",
+                    "work item", "work items"]
+    },
+    "Units": {
+        "keywords": ["unit", "units", "uom", "measure", "unit of measure", "qty unit",
+                    "u.o.m", "unit of measurement", "u.o.m.", "measurement"]
+    },
+    "Quantity": {
+        "keywords": ["quantity", "quantities", "quantity (in", "quantity(in", "quantity in",
+                    "estimated quantity", "estimated qty", "qty", "quanity", "est. qty", "est qty", 
+                    "estimated quanity", "total qty", "number", "nos", "volume", "amount", 
+                    "no of items", "count", "number of items", "in figures", "infigures", 
+                    "(in figures)", "figures"]
+    },
+    "Govt Rate - Input": {
+        "keywords": ["rate in", "ratein", "rate (in", "rate(in", "rate in (in", "est", "est rates", 
+                    "est rate", "estimated rates", "estimated rate", "rate", "rates", "market rate", 
+                    "mkt rate", "mrkt rate", "market rates", "govt rate", "government rate", 
+                    "official rate", "base rate", "approved rate", "tender rate", "schedule rate", 
+                    "sch rate", "spec rate", "agreed rate", "rates (rs.)", "rates (r", "rates rs", 
+                    "est price", "govt price", "specifications", "in words", "inwords", "(in words)", "words"]
+    },
+    "Quoted Rate - Input": {
+        "keywords": ["quoted rate", "quote rate", "quoted rates", "rates (rs.)", "offer rate",
+                    "bid rate", "client rate", "our rate", "contractor rate", "contract rates",
+                    "final rate", "negotiated rate", "amounts (rs.)", "amounts (r", "amounts rs",
+                    "amounts", "bid price", "offered price", "your rate"]
+    },
+}
+
+FINAL_COLUMN_ORDER = [
+    "Sr No.", "Items Description", "Units", "Units No.", "Quantity",
+    "Govt Rate - Input", "Govt Rate - Total", "Quoted Rate - Input", "Quoted Rate - Total"
+]
+
+CRITICAL_HEADER_COLUMNS = ["Sr No.", "Items Description", "Units", "Quantity"]
+CRITICAL_COLUMN_WEIGHT = 5
+NON_CRITICAL_COLUMN_WEIGHT = 1
+MAX_HEADER_SCAN_ROWS = 15
+
+COLUMN_WEIGHTS = {
+    col: CRITICAL_COLUMN_WEIGHT if col in CRITICAL_HEADER_COLUMNS else NON_CRITICAL_COLUMN_WEIGHT
+    for col in PDF_COLUMN_MAPPING_RULES.keys()
+}
+
+# ============================================================================
+# SECURITY MIDDLEWARE
+# ============================================================================
+
+def require_api_key(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not ENABLE_API_KEY:
+            return f(*args, **kwargs)
+        
+        api_key = request.headers.get('X-API-Key')
+        if not api_key or api_key != API_KEY:
+            logger.warning(f"Unauthorized access attempt from {get_remote_address()}")
+            return jsonify({"error": "Invalid or missing API key"}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+def validate_pdf_file(file):
+    """Validate uploaded file"""
+    if not file:
+        return False, "No file provided"
+    
+    if file.filename == '':
+        return False, "No file selected"
+    
+    if not file.filename.lower().endswith('.pdf'):
+        return False, "File must be a PDF"
+    
+    # Check file size
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+    
+    if file_size > app.config['MAX_CONTENT_LENGTH']:
+        return False, f"File too large. Maximum size: {app.config['MAX_CONTENT_LENGTH'] // (1024*1024)}MB"
+    
+    if file_size == 0:
+        return False, "File is empty"
+    
+    return True, None
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def convert_unit_to_number(unit_string):
+    if not isinstance(unit_string, str):
+        return 1.0
+    unit_string_cleaned = unit_string.strip().lower()
+    if any(pattern in unit_string_cleaned for pattern in ["%0", "%o", "% 0", "% o"]):
+        return 1000.0
+    elif "%" in unit_string_cleaned:
+        return 100.0
+    return UNIT_CONVERSIONS.get(unit_string_cleaned, 1.0)
+
+def calculate_total_rate(input_rate, quantity, units_no):
+    input_rate = pd.to_numeric(input_rate, errors='coerce').fillna(0.0)
+    quantity = pd.to_numeric(quantity, errors='coerce').fillna(0.0)
+    units_no = pd.to_numeric(units_no, errors='coerce').fillna(1.0)
+    units_no = units_no.apply(lambda x: 1.0 if x == 0 else x)
+    return (input_rate * quantity) / units_no
+
+def recalculate_editor_df_values(df):
+    df_copy = df.copy()
+    if "Units" in df_copy.columns:
+        df_copy["Units No."] = df_copy["Units"].apply(convert_unit_to_number)
+    df_copy["Units No."] = pd.to_numeric(df_copy["Units No."], errors='coerce').fillna(1.0)
+    df_copy["Units No."] = df_copy["Units No."].apply(lambda x: 1.0 if x == 0 else x)
+    for col in ["Quantity", "Govt Rate - Input", "Quoted Rate - Input"]:
+        if col in df_copy.columns:
+            df_copy[col] = pd.to_numeric(df_copy[col], errors='coerce').fillna(0.0)
+    if all(col in df_copy.columns for col in ["Govt Rate - Input", "Quantity", "Units No."]):
+        df_copy["Govt Rate - Total"] = calculate_total_rate(
+            df_copy["Govt Rate - Input"], df_copy["Quantity"], df_copy["Units No."])
+    if all(col in df_copy.columns for col in ["Quoted Rate - Input", "Quantity", "Units No."]):
+        df_copy["Quoted Rate - Total"] = calculate_total_rate(
+            df_copy["Quoted Rate - Input"], df_copy["Quantity"], df_copy["Units No."])
+    return df_copy
+
+def clean_dataframe_for_json(df):
+    df = df.copy()
+    df = df.replace({np.nan: None, np.inf: None, -np.inf: None})
+    return df
+
+def is_likely_data_row(row_series):
+    row_str = ' '.join([str(cell) for cell in row_series.tolist()]).strip().lower()
+    if not row_str or row_str.replace(' ', '') == '':
+        return False
+    note_keywords = [
+        'bidder shall', 'contractor shall', 'payment shall', 'note:', 
+        'all equipment', 'in case of', 'the bidder', 'lump-sum price',
+        'shall be made', 'prevailing taxes', 'municipal corporation',
+        'lowest evaluated', 'price schedule', 'financial', 'certificate',
+        'supplies, and materials', 'delivery note', 'satisfactory',
+        'financially evaluate', 'discrepancy', 'multiple price', 'branded',
+        'actual work', 'testing of work', 'concerned officer', 'claim the bill',
+        'completion of work', 'right to change', 'scope of work', 'cancel the bid',
+        'fill-up', 'submit to', 'alternative', 'incomplete', 'rejected', 'prevail'
+    ]
+    if any(keyword in row_str for keyword in note_keywords):
+        return False
+    has_number = any(str(cell).replace('.', '').replace(',', '').isdigit() 
+                    for cell in row_series.tolist())
+    return has_number or len(row_str) > 10
+
+def is_valid_sr_no(value):
+    """
+    Check if value is a valid serial number (1-200 or Roman numerals)
+    Handles formats like: 11, 14(i), ii, iii, i1, etc.
+    
+    CRITICAL: Must distinguish between Sr. No. and other numbers
+    """
+    if not value or pd.isna(value):
+        return False
+    
+    try:
+        value_str = str(value).strip()
+        
+        # Empty or too long (descriptions can have numbers)
+        if not value_str or len(value_str) > 15:
+            return False
+        
+        # Check for pure Roman numerals (standalone or with prefix)
+        # Examples: "i", "ii", "iii", "14(i)", "i1"
+        roman_pattern = r'^[ivxlcdm]+$|^\d+\s*[\(\[]?[ivxlcdm]+[\)\]]?$|^[ivxlcdm]+\d+$'
+        if re.match(roman_pattern, value_str.lower()):
+            return True
+        
+        # Remove punctuation and whitespace for number extraction
+        clean_str = re.sub(r'[\.\s,\(\)\[\]\-]', '', value_str)
+        
+        # Skip if contains alphabetic characters (except roman numerals already handled)
+        if re.search(r'[a-hj-uwyz]', clean_str, re.IGNORECASE):
+            return False
+        
+        # Try to parse as integer
+        try:
+            num = int(float(clean_str))
+        except:
+            return False
+        
+        # CRITICAL DISTINCTION: Sr. No. is 1-200
+        # Quantities and rates are usually much larger
+        if not (1 <= num <= 200):
+            return False
+        
+        # Additional validation: if original value has decimal point, probably not Sr. No.
+        if '.' in value_str and num > 50:
+            return False
+        
+        return True
+        
+    except Exception as e:
+        return False
+
+def is_new_item_row(row_dict):
+    """
+    RELAXED RULES: Determine if row starts a NEW item
+    
+    A row is NEW if ANY of these conditions are true:
+    1. Has valid Sr. No. (1-200) in Sr. No. column
+    2. Has Quantity AND (Units OR Description with significant length)
+    3. Has Description with significant content AND some numeric data
+    """
+    sr_no = str(row_dict.get("Sr No.", "")).strip()
+    quantity = str(row_dict.get("Quantity", "")).strip()
+    units = str(row_dict.get("Units", "")).strip()
+    govt_rate = str(row_dict.get("Govt Rate - Input", "")).strip()
+    quoted_rate = str(row_dict.get("Quoted Rate - Input", "")).strip()
+    description = str(row_dict.get("Items Description", "")).strip()
+    
+    # Condition 1: Has valid serial number (strong signal)
+    if is_valid_sr_no(sr_no):
+        return True
+    
+    # Condition 2: Has quantity with units or description
+    has_qty = False
+    try:
+        if quantity and quantity not in ['nan', '0', '0.0', '', 'None']:
+            qty_val = float(quantity)
+            has_qty = qty_val > 0
+    except:
+        pass
+    
+    has_units = units and units not in ['nan', '0', '0.0', '', 'None']
+    has_description = description and len(description) > 20
+    
+    if has_qty and (has_units or has_description):
+        return True
+    
+    # Condition 3: Has substantial description AND any numeric data
+    has_any_rate = False
+    try:
+        if govt_rate and govt_rate not in ['nan', '0', '0.0', '', 'None']:
+            has_any_rate = float(govt_rate) > 0
+        elif quoted_rate and quoted_rate not in ['nan', '0', '0.0', '', 'None']:
+            has_any_rate = float(quoted_rate) > 0
+    except:
+        pass
+    
+    if has_description and (has_qty or has_units or has_any_rate):
+        return True
+    
+    return False
+
+
+def merge_continuation_rows(filtered_rows, header_column_map):
+    """
+    IMPROVED: Merge multi-line descriptions with better detection
+    """
+    if not filtered_rows:
+        return []
+    
+    merged_rows = []
+    current_row = None
+    
+    logger.info(f"🔍 Processing {len(filtered_rows)} filtered rows")
+    logger.info("=" * 80)
+    
+    for idx, row in enumerate(filtered_rows):
+        # Convert to dictionary
+        row_dict = {}
+        for target_col, source_col_idx in header_column_map.items():
+            if source_col_idx < len(row):
+                cell_value = row.iloc[source_col_idx]
+                row_dict[target_col] = str(cell_value).strip() if pd.notna(cell_value) else ""
+            else:
+                row_dict[target_col] = ""
+        
+        # Clean empty values
+        for col in row_dict:
+            if row_dict[col] in ['nan', 'None', '0.0']:
+                row_dict[col] = ""
+        
+        # Extract key fields for logging
+        sr_no = row_dict.get("Sr No.", "")
+        desc_preview = row_dict.get("Items Description", "")[:80]
+        qty = row_dict.get("Quantity", "")
+        units = row_dict.get("Units", "")
+        
+        # Determine if NEW item or CONTINUATION (now more lenient)
+        is_new = is_new_item_row(row_dict)
+        
+        # Detailed logging
+        logger.info(f"Row {idx:3d}: {'NEW' if is_new else 'CONT'} | Sr={sr_no:5s} | Qty={qty:10s} | Units={units:10s}")
+        logger.info(f"           Desc: {desc_preview}")
+        
+        if is_new:
+            # Save previous item before starting new one
+            if current_row is not None:
+                if any(v for v in current_row.values() if v and v not in ['0', '', 'None']):
+                    # Final cleanup of description
+                    if "Items Description" in current_row:
+                        desc = current_row["Items Description"].strip()
+                        # Remove ONLY leading standalone numbers
+                        desc = re.sub(r'^\d+\s+', '', desc)
+                        desc = re.sub(r'^[ivxlcdm]+\s+', '', desc, flags=re.IGNORECASE)
+                        desc = re.sub(r'\s+', ' ', desc)
+                        current_row["Items Description"] = desc.strip()
+                    
+                    merged_rows.append(current_row)
+                    logger.info(f"           ✅ SAVED item Sr. No.: {current_row.get('Sr No.', 'N/A')}")
+            
+            # Start NEW item with this row's data
+            current_row = row_dict.copy()
+            logger.info(f"           🆕 STARTED new item: Sr={sr_no}")
+        
+        else:
+            # CONTINUATION row - merge ONLY description
+            if current_row is not None:
+                cont_desc = row_dict.get("Items Description", "").strip()
+                
+                # Only merge if continuation has actual text
+                if cont_desc and cont_desc not in ['nan', '0', '', 'None']:
+                    # Remove any accidental Sr. No. from continuation text
+                    cont_desc = re.sub(r'^\d+\s+', '', cont_desc)
+                    cont_desc = re.sub(r'^[ivxlcdm]+\s+', '', cont_desc, flags=re.IGNORECASE)
+                    
+                    current_desc = current_row.get("Items Description", "").strip()
+                    
+                    if current_desc:
+                        current_row["Items Description"] = current_desc + " " + cont_desc
+                    else:
+                        current_row["Items Description"] = cont_desc
+                    
+                    logger.info(f"           📝 MERGED: {cont_desc[:60]}...")
+                
+                # Preserve numeric data from continuation if main row lacks it
+                for col in ["Quantity", "Units", "Govt Rate - Input", "Quoted Rate - Input"]:
+                    value = row_dict.get(col, "").strip()
+                    if value and value not in ['nan', '0', '0.0', '', 'None']:
+                        current_value = current_row.get(col, "").strip()
+                        if not current_value or current_value in ['nan', '0', '0.0', '', 'None']:
+                            current_row[col] = value
+                            logger.info(f"           📊 Added {col}: {value}")
+            else:
+                # No current row - start new one (safety)
+                current_row = row_dict.copy()
+                logger.warning(f"           ⚠️ Orphan continuation - creating new item")
+        
+        logger.info("")
+    
+    # Save the last item
+    if current_row is not None:
+        if any(v for v in current_row.values() if v and v not in ['0', '', 'None']):
+            if "Items Description" in current_row:
+                desc = current_row["Items Description"].strip()
+                desc = re.sub(r'^\d+\s+', '', desc)
+                desc = re.sub(r'^[ivxlcdm]+\s+', '', desc, flags=re.IGNORECASE)
+                desc = re.sub(r'\s+', ' ', desc)
+                current_row["Items Description"] = desc.strip()
+            
+            merged_rows.append(current_row)
+            logger.info(f"✅ SAVED final item with Sr. No.: {current_row.get('Sr No.', 'N/A')}")
+    
+    logger.info("=" * 80)
+    logger.info(f"✅ Merge complete: {len(filtered_rows)} rows → {len(merged_rows)} items")
+    
+    return merged_rows
+
+def fallback_header_detection(df):
+    """
+    Enhanced fallback header detection with PRIORITY for leftmost columns.
+    Handles tables with multiple description columns (Item Name vs Specification).
+    """
+    logger.info("Using fallback header detection")
+    temp_df = df.copy().astype(str).replace('', pd.NA)
+    temp_df = temp_df.dropna(axis=1, how='all')
+    temp_df = temp_df.iloc[:50, :] 
+    fallback_map = {}
+    available_indices = list(range(len(temp_df.columns)))
+    
+    # ========== CRITICAL: Find Sr No. column first ==========
+    best_sr_no_score = -1
+    best_sr_no_col_idx = None
+    
+    for i in available_indices:
+        series = temp_df.iloc[:, i].dropna().reset_index(drop=True)
+        if len(series) > 2:
+            try:
+                valid_sr_count = sum(1 for val in series.head(30) if is_valid_sr_no(val))
+                        
+                if valid_sr_count < 3:
+                    continue
+                
+                sequential_score = 0
+                prev_num = None
+                        
+                for val in series.head(20):
+                    if is_valid_sr_no(val):
+                        try:
+                            val_str = str(val).strip()
+                            num_match = re.match(r'(\d+)', val_str)
+                            if num_match:
+                                num = int(num_match.group(1))
+                                if prev_num and num == prev_num + 1:
+                                    sequential_score += 10
+                                elif prev_num and num > prev_num:
+                                    sequential_score += 3
+                                prev_num = num
+                        except:
+                            pass
+                        
+                score = valid_sr_count * 20 + sequential_score
+                        
+                try:
+                    numeric_series = pd.to_numeric(series, errors='coerce').dropna()
+                    if len(numeric_series) > 0:
+                        avg_val = numeric_series.mean()
+                        max_val = numeric_series.max()
+                        min_val = numeric_series.min()
+                                        
+                        if avg_val > 100:
+                            score = score / 10
+                        if max_val > 500:
+                            score = score / 20
+                        if min_val > 50:
+                            score = score / 5
+                        
+                        value_range = max_val - min_val
+                        if value_range > 500:
+                            score = score / 10
+                except:
+                    pass
+                
+                try:
+                    first_vals = [int(float(str(v).strip())) for v in series.head(5) if is_valid_sr_no(v)]
+                    if first_vals and first_vals[0] == 1:
+                        score += 50
+                    if len(first_vals) >= 3 and first_vals == list(range(first_vals[0], first_vals[0] + len(first_vals))):
+                        score += 100
+                except:
+                    pass
+                        
+                if score > best_sr_no_score:
+                    best_sr_no_score = score
+                    best_sr_no_col_idx = i
+                    
+            except Exception as e:
+                continue
+    
+    if best_sr_no_col_idx is not None:
+        fallback_map["Sr No."] = best_sr_no_col_idx
+        available_indices.remove(best_sr_no_col_idx)
+        logger.info(f"✅ Sr No. detected at column {best_sr_no_col_idx} (score: {best_sr_no_score:.1f})")
+    else:
+        logger.warning("⚠️ Could not detect Sr No. column!")
+    
+    # ========== NEW: Find Items Description - PRIORITIZE LEFTMOST long text column ==========
+    # This handles tables with both "Item Name" and "Specification" columns
+    best_desc_score = -1
+    best_desc_col_idx = None
+    description_candidates = []  # Store all candidates with scores
+    
+    for i in available_indices:
+        series = temp_df.iloc[:, i].dropna()
+        if len(series) > 0:
+            avg_length = series.str.len().mean()
+            total_chars = series.str.len().sum()
+            
+            alpha_count = series.str.replace(r'[^a-zA-Z]', '', regex=True).str.len().sum()
+            
+            if total_chars > 0:
+                alpha_ratio = alpha_count / total_chars
+                
+                # Base score: prefer long text with high alphabetic ratio
+                score = avg_length * alpha_ratio * 100
+                
+                # Bonus for very long descriptions
+                if avg_length > 50:
+                    score += 50
+                
+                # CRITICAL: Strong bonus for leftmost position (earlier columns)
+                # This prioritizes "Item Name" over "Specification"
+                position_bonus = (len(available_indices) - available_indices.index(i)) * 15
+                score += position_bonus
+                
+                # Minimum average length requirement
+                if avg_length > 20:
+                    description_candidates.append({
+                        'index': i,
+                        'score': score,
+                        'avg_length': avg_length,
+                        'position': available_indices.index(i)
+                    })
+    
+    # Sort by score and pick best
+    if description_candidates:
+        description_candidates.sort(key=lambda x: x['score'], reverse=True)
+        best_desc_col_idx = description_candidates[0]['index']
+        best_desc_score = description_candidates[0]['score']
+        
+        logger.info(f"✅ Items Description detected at column {best_desc_col_idx} (score: {best_desc_score:.1f})")
+        logger.info(f"   Candidates found: {len(description_candidates)}")
+        for cand in description_candidates[:3]:  # Show top 3
+            logger.info(f"   - Col {cand['index']}: score={cand['score']:.1f}, avg_len={cand['avg_length']:.1f}, pos={cand['position']}")
+    
+    if best_desc_col_idx is not None:
+        fallback_map["Items Description"] = best_desc_col_idx
+        available_indices.remove(best_desc_col_idx)
+    
+    # ========== Find Units - short text with unit keywords ==========
+    best_unit_score = -1
+    best_unit_col_idx = None
+    unit_keywords = ['cft', 'p.no', 'p-no', 'p.cft', 'p cft', 'nos', 'each', 'lot', 'kgs', 
+                     'meter', 'hour', 'day', 'sqm', 'cum', 'sft', 'kg', 'rft', 'p.rft', 'p.sft',
+                     '% sft', 'ton', 'liter', 'gallon', 'rfl', '% cft', 'p.sft']
+    
+    for i in available_indices:
+        series = temp_df.iloc[:, i].dropna()
+        if len(series) > 0:
+            avg_length = series.str.len().mean()
+            series_lower = series.str.lower()
+            series_text = series_lower.str.cat(sep=' ')
+            
+            # Count unit keyword matches
+            keyword_matches = sum(1 for keyword in unit_keywords if keyword in series_text)
+            
+            # Units should be short text (2-15 chars)
+            if 2 < avg_length < 15:
+                score = keyword_matches * 50 + 10
+                
+                if score > best_unit_score:
+                    best_unit_score = score
+                    best_unit_col_idx = i
+    
+    if best_unit_col_idx is not None:
+        fallback_map["Units"] = best_unit_col_idx
+        available_indices.remove(best_unit_col_idx)
+        logger.info(f"✅ Units detected at column {best_unit_col_idx}")
+    
+    # ========== Find Quantity - numeric column with reasonable values ==========
+    best_qty_score = -1
+    best_qty_col_idx = None
+    
+    for i in available_indices:
+        series = temp_df.iloc[:, i].dropna()
+        if len(series) > 0:
+            try:
+                numeric_series = pd.to_numeric(series, errors='coerce').dropna()
+                numeric_count = len(numeric_series)
+                
+                if numeric_count > len(series) * 0.3: 
+                    avg_value = numeric_series.mean()
+                    max_value = numeric_series.max()
+                    
+                    score = numeric_count * 2
+                    
+                    # Ideal quantity range: 1-10000
+                    if 1 < avg_value < 10000:
+                        score += 30
+                    elif avg_value < 1:
+                        score = score / 3
+                    
+                    # Penalize if looks like Sr. No.
+                    if avg_value < 50 and max_value < 200:
+                        score = score / 10
+                    
+                    if score > best_qty_score:
+                        best_qty_score = score
+                        best_qty_col_idx = i
+            except:
+                continue
+    
+    if best_qty_col_idx is not None:
+        fallback_map["Quantity"] = best_qty_col_idx
+        available_indices.remove(best_qty_col_idx)
+        logger.info(f"✅ Quantity detected at column {best_qty_col_idx}")
+    
+    # ========== Find rate columns ==========
+    rate_cols = []
+    for i in available_indices:
+        series = temp_df.iloc[:, i].dropna()
+        if len(series) > 0:
+            try:
+                numeric_series = pd.to_numeric(series, errors='coerce').dropna()
+                numeric_count = len(numeric_series)
+                
+                if numeric_count > 0:
+                    avg_val = numeric_series.mean()
+                    
+                    score = numeric_count
+                    if avg_val > 100:
+                        score += 20
+                    
+                    rate_cols.append((i, score))
+            except:
+                continue
+    
+    rate_cols.sort(key=lambda x: x[1], reverse=True)
+    
+    if len(rate_cols) >= 1:
+        fallback_map["Govt Rate - Input"] = rate_cols[0][0]
+        logger.info(f"✅ Govt Rate detected at column {rate_cols[0][0]}")
+    if len(rate_cols) >= 2:
+        fallback_map["Quoted Rate - Input"] = rate_cols[1][0]
+        logger.info(f"✅ Quoted Rate detected at column {rate_cols[1][0]}")
+    
+    logger.info(f"Final fallback mapping: {fallback_map}")
+    return fallback_map
+
+
+# Also update the keyword mapping to include more "Item Name" variants
+PDF_COLUMN_MAPPING_RULES = {
+    "Sr No.": {
+        "keywords": ["sr.no", "sr no.", "sr no", "sr. no", "sr. no.", "seriel number", "srno", "s.no",
+                    "serial no", "serial number", "sr.", "no.", "sno", "s. no", "srl no", "item no", 
+                    "idx", "index", "chap no", "sl no", "s.l.no", "sl.no", "s.no", "sr .no"]
+    },
+    "Items Description": {
+        "keywords": [
+            # PRIMARY: Item Name variants (should match first)
+            "item name", "itemname", "item-name", "item_name",
+            # SECONDARY: Description variants
+            "items", "item description", "items description", "item desc", 
+            "description", "description of item", "desc", "particulars",
+            "details", "material description", "scope of work", "work description", 
+            "narration", "item details", "particuler of item", "particular", "specifications",
+            "work item", "work items",
+            # Note: "specification" removed to avoid confusion with separate Specification column
+        ]
+    },
+    "Units": {
+        "keywords": ["unit", "units", "uom", "measure", "unit of measure", "qty unit",
+                    "u.o.m", "unit of measurement", "u.o.m.", "measurement"]
+    },
+    "Quantity": {
+        "keywords": ["quantity", "quantities", "quantity (in", "quantity(in", "quantity in",
+                    "estimated quantity", "estimated qty", "qty", "quanity", "est. qty", "est qty", 
+                    "estimated quanity", "total qty", "number", "nos", "volume", "amount", 
+                    "no of items", "count", "number of items", "in figures", "infigures", 
+                    "(in figures)", "figures"]
+    },
+    "Govt Rate - Input": {
+        "keywords": ["rate in", "ratein", "rate (in", "rate(in", "rate in (in", "est", "est rates", 
+                    "est rate", "estimated rates", "estimated rate", "rate", "rates", "market rate", 
+                    "mkt rate", "mrkt rate", "market rates", "govt rate", "government rate", 
+                    "official rate", "base rate", "approved rate", "tender rate", "schedule rate", 
+                    "sch rate", "spec rate", "agreed rate", "rates (rs.)", "rates (r", "rates rs", 
+                    "est price", "govt price", "specifications", "in words", "inwords", "(in words)", "words"]
+    },
+    "Quoted Rate - Input": {
+        "keywords": ["quoted rate", "quote rate", "quoted rates", "rates (rs.)", "offer rate",
+                    "bid rate", "client rate", "our rate", "contractor rate", "contract rates",
+                    "final rate", "negotiated rate", "amounts (rs.)", "amounts (r", "amounts rs",
+                    "amounts", "bid price", "offered price", "your rate"]
+    },
+}
+
+
+def find_closest_x(x, x_coords):
+    return np.argmin(np.abs(x_coords - x))
+
+def ocr_to_dataframe(results):
+    if not results:
+        return pd.DataFrame()
+    sorted_results = sorted(results, key=lambda r: (r[0][0][1], r[0][0][0]))
+    rows = {}
+    row_tol = 10
+    for r in sorted_results:
+        y_center = (r[0][0][1] + r[0][2][1]) / 2
+        row_key = None
+        for key in rows:
+            if abs(key - y_center) < row_tol:
+                row_key = key
+                break
+        if row_key is None:
+            row_key = y_center
+            rows[row_key] = []
+        rows[row_key].append(r)
+    
+    all_x = [r[0][0][0] for r in sorted_results]
+    unique_x = sorted(list(set(all_x)))
+    column_centers = []
+    if unique_x:
+        column_centers.append(unique_x[0])
+        for x_coord in unique_x[1:]:
+            if x_coord - column_centers[-1] > 20:
+                column_centers.append(x_coord)
+    
+    df_rows = []
+    for row_key in sorted(rows.keys()):
+        row_data = rows[row_key]
+        row_cells = {}
+        for r in row_data:
+            x_center = (r[0][0][0] + r[0][1][0]) / 2
+            text = r[1]
+            col_idx = find_closest_x(x_center, np.array(column_centers))
+            row_cells.setdefault(col_idx, []).append(text)
+        row_dict = {f'col_{col_idx}': ' '.join(words) for col_idx, words in row_cells.items()}
+        df_rows.append(row_dict)
+    
+    if not df_rows:
+        return pd.DataFrame()
+    return pd.DataFrame(df_rows).fillna("")
+
+def extract_tables_with_ocr(pdf_bytes, pages):
+    try:
+        images = convert_from_bytes(pdf_bytes)
+    except Exception as e:
+        return [], f"Error converting PDF to images: {str(e)}"
+    
+    reader = easyocr.Reader(['en'], gpu=False)
+    all_dfs = []
+    
+    for i, image in enumerate(images):
+        if pages != 'all' and str(i + 1) not in pages.split(','):
+            continue
+        try:
+            results = reader.readtext(np.array(image))
+            df = ocr_to_dataframe(results)
+            if not df.empty:
+                all_dfs.append(df)
+        except Exception as e:
+            logger.error(f"OCR failed on page {i + 1}: {e}")
+    
+    return all_dfs, None
+
+def extract_pdf_tables(pdf_bytes, pages_arg):
+    """Extract tables with proper BytesIO handling"""
+    # Try lattice
+    try:
+        logger.info("Trying lattice extraction...")
+        # Create a temporary file for Camelot (it needs a file path, not BytesIO)
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(pdf_bytes)
+            tmp_path = tmp_file.name
+        
+        try:
+            tables = camelot.read_pdf(
+                tmp_path, 
+                pages=pages_arg, 
+                flavor='lattice',
+                line_scale=40,
+                copy_text=['v']
+            )
+            if len(tables) > 0:
+                all_extracted_dfs = []
+                for table in tables:
+                    if not table.df.empty and table.df.shape[0] > 2:
+                        all_extracted_dfs.append(table.df)
+                if all_extracted_dfs:
+                    logger.info(f"Lattice extraction found {len(all_extracted_dfs)} tables")
+                    return all_extracted_dfs, None, "lattice"
+        finally:
+            # Clean up temp file
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
+    except Exception as e:
+        logger.warning(f"Lattice extraction failed: {e}")
+    
+    # Try stream
+    try:
+        logger.info("Trying stream extraction...")
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(pdf_bytes)
+            tmp_path = tmp_file.name
+        
+        try:
+            tables = camelot.read_pdf(
+                tmp_path,
+                pages=pages_arg,
+                flavor='stream',
+                edge_tol=50,
+                row_tol=10,
+                column_tol=10
+            )
+            if len(tables) > 0:
+                all_extracted_dfs = []
+                for table in tables:
+                    if not table.df.empty and table.df.shape[0] > 2:
+                        all_extracted_dfs.append(table.df)
+                if all_extracted_dfs:
+                    logger.info(f"Stream extraction found {len(all_extracted_dfs)} tables")
+                    return all_extracted_dfs, None, "stream"
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
+    except Exception as e:
+        logger.warning(f"Stream extraction failed: {e}")
+    
+    # Fallback to OCR
+    logger.info("Falling back to OCR extraction...")
+    extracted_dfs, error = extract_tables_with_ocr(pdf_bytes, pages_arg)
+    if error or not extracted_dfs:
+        return None, "No tables found with any method", None
+    return extracted_dfs, None, "ocr"
+
+def process_extracted_tables(extracted_dfs):
+    """Process extracted tables with enhanced debugging"""
+    if not extracted_dfs:
+        return None, "No data to process"
+    
+    # Combine all DataFrames
+    combined_df = pd.DataFrame()
+    for df in extracted_dfs:
+        if not df.empty:
+            combined_df = pd.concat([combined_df, df], ignore_index=True)
+    
+    if combined_df.empty:
+        return None, "No valid tables found"
+    
+    df_first_page = combined_df.copy()
+    df_first_page.columns = [str(col).strip() for col in df_first_page.columns]
+    
+    logger.info(f"📊 Table shape: {df_first_page.shape}")
+    logger.info(f"📊 First 5 rows:\n{df_first_page.head()}")
+    
+    # Try keyword-based header detection first
+    best_header_row_idx = -1
+    max_weighted_matches = 0
+    header_column_map = {}
+    
+    for row_idx in range(min(MAX_HEADER_SCAN_ROWS, df_first_page.shape[0])):
+        current_row = [str(cell).strip().lower() for cell in df_first_page.iloc[row_idx].tolist()]
+        current_weighted_matches = 0
+        temp_map = {}
+        
+        for target_col, rules in PDF_COLUMN_MAPPING_RULES.items():
+            for i, cell_content in enumerate(current_row):
+                if any(keyword in cell_content for keyword in rules["keywords"]):
+                    temp_map[target_col] = i
+                    current_weighted_matches += COLUMN_WEIGHTS.get(target_col, NON_CRITICAL_COLUMN_WEIGHT)
+                    break
+        
+        if current_weighted_matches > max_weighted_matches:
+            max_weighted_matches = current_weighted_matches
+            best_header_row_idx = row_idx
+            header_column_map = temp_map.copy()
+    
+    # If keyword matching fails, use fallback
+    if max_weighted_matches < 3 or not header_column_map:
+        logger.info("⚠️ Keyword matching failed, using fallback detection")
+        header_column_map = fallback_header_detection(df_first_page)
+        best_header_row_idx = 0
+    
+    if not header_column_map:
+        return None, "Could not identify table structure"
+    
+    logger.info(f"✅ Header at row: {best_header_row_idx}")
+    logger.info(f"✅ Column mapping: {header_column_map}")
+    
+    # Extract data rows
+    data_start_row = best_header_row_idx + 1
+    raw_data_rows = df_first_page.iloc[data_start_row:].copy()
+    
+    # Filter valid data rows
+    filtered_rows = []
+    for idx, row in raw_data_rows.iterrows():
+        if is_likely_data_row(row):
+            filtered_rows.append(row)
+    
+    if not filtered_rows:
+        return None, "No valid data rows found"
+    
+    logger.info(f"📊 Found {len(filtered_rows)} candidate rows")
+    
+    # Merge continuation rows
+    structured_data = merge_continuation_rows(filtered_rows, header_column_map)
+    
+    # Remove empty rows
+    structured_data = [
+        row for row in structured_data 
+        if any(val for val in row.values() if val and val not in ['0', 'nan', '', 'None'])
+    ]
+    
+    if not structured_data:
+        return None, "No structured data extracted"
+    
+    logger.info(f"✅ Final: {len(structured_data)} items")
+    
+    # Create DataFrame
+    final_df = pd.DataFrame(structured_data)
+    
+    # Add missing columns
+    for col in FINAL_COLUMN_ORDER:
+        if col not in final_df.columns:
+            final_df[col] = 1.0 if col == "Units No." else ""
+    
+    # Recalculate
+    final_df = recalculate_editor_df_values(final_df)
+    final_df = final_df[FINAL_COLUMN_ORDER]
+    
+    # Debug output
+    logger.info("=" * 80)
+    logger.info("EXTRACTED ITEMS (First 5):")
+    for i, row in final_df.head(5).iterrows():
+        logger.info(f"  Sr.{row['Sr No.']}: {row['Items Description'][:60]}... | Qty: {row['Quantity']} {row['Units']}")
+    logger.info("=" * 80)
+    
+    return final_df, None
+
+def generate_excel_from_df(df, name=None):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Extracted Data"
+    
+    header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+    header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    
+    for idx, col in enumerate(FINAL_COLUMN_ORDER):
+        cell = ws.cell(row=3, column=idx + 1, value=col)
+        cell.font = Font(bold=True, color="FFFFFF", size=11)
+        cell.fill = header_fill
+        cell.alignment = header_alignment
+    
+    col_to_letter = {col: get_column_letter(idx + 1) for idx, col in enumerate(FINAL_COLUMN_ORDER)}
+    
+    initial_data_row = 3
+    for row_idx, (_, row) in enumerate(df.iterrows()):
+        excel_row_num = initial_data_row + 1 + row_idx
+        row_values = []
+        
+        for col_name in FINAL_COLUMN_ORDER:
+            if col_name in ["Govt Rate - Total", "Quoted Rate - Total"]:
+                input_col = "Govt Rate - Input" if "Govt" in col_name else "Quoted Rate - Input"
+                input_letter = col_to_letter[input_col]
+                qty_letter = col_to_letter["Quantity"]
+                units_letter = col_to_letter["Units No."]
+                
+                formula = (
+                    f"=(IFERROR(VALUE({input_letter}{excel_row_num}),0)*"
+                    f"IFERROR(VALUE({qty_letter}{excel_row_num}),0))/"
+                    f"(IF(OR(ISBLANK({units_letter}{excel_row_num}),"
+                    f"IFERROR(VALUE({units_letter}{excel_row_num}),1)=0),1,"
+                    f"IFERROR(VALUE({units_letter}{excel_row_num}),1)))"
+                )
+                row_values.append(formula)
+            else:
+                val = row.get(col_name)
+                row_values.append(None if pd.isna(val) else str(val))
+        
+        ws.append(row_values)
+    
+    for idx, col in enumerate(FINAL_COLUMN_ORDER):
+        col_letter = get_column_letter(idx + 1)
+        if col == "Items Description":
+            ws.column_dimensions[col_letter].width = 70
+        else:
+            ws.column_dimensions[col_letter].width = 15
+        
+        for r in range(initial_data_row + 1, ws.max_row + 1):
+            ws.cell(row=r, column=idx + 1).alignment = Alignment(wrap_text=True, vertical='top')
+    
+    thin_border = Border(
+        left=Side(style='thin'), right=Side(style='thin'),
+        top=Side(style='thin'), bottom=Side(style='thin')
+    )
+    
+    for row in ws.iter_rows(min_row=initial_data_row, max_row=ws.max_row, 
+                           min_col=1, max_col=ws.max_column):
+        for cell in row:
+            cell.border = thin_border
+    
+    current_end_row = ws.max_row
+    
+    # Grand totals
+    govt_letter = col_to_letter["Govt Rate - Total"]
+    quoted_letter = col_to_letter["Quoted Rate - Total"]
+    
+    # Govt total
+    ws.append(["Grand Total (Govt)"] + [""] * (len(FINAL_COLUMN_ORDER) - 1))
+    govt_row = ws.max_row
+    ws.cell(row=govt_row, column=FINAL_COLUMN_ORDER.index("Govt Rate - Total") + 1,
+            value=f"=SUM({govt_letter}{initial_data_row + 1}:{govt_letter}{current_end_row})")
+    
+    for cell in ws[govt_row]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(start_color="E7E6E6", end_color="E7E6E6", fill_type="solid")
+        cell.border = thin_border
+    
+    # Quoted total
+    ws.append(["Grand Total (Quoted)"] + [""] * (len(FINAL_COLUMN_ORDER) - 1))
+    quoted_row = ws.max_row
+    ws.cell(row=quoted_row, column=FINAL_COLUMN_ORDER.index("Quoted Rate - Total") + 1,
+            value=f"=SUM({quoted_letter}{initial_data_row + 1}:{quoted_letter}{current_end_row})")
+    
+    for cell in ws[quoted_row]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill(start_color="E7E6E6", end_color="E7E6E6", fill_type="solid")
+        cell.border = thin_border
+    
+    # Add document name
+    if name:
+        ws['A1'] = name
+        ws['A1'].font = Font(bold=True, size=14)
+        ws['A1'].border = thin_border
+        ws.merge_cells('A1:C1')
+    
+    # Rate below calculation
+    ws[f'{govt_letter}1'] = 'Rate Below From Govt Rate'
+    ws[f'{govt_letter}1'].font = Font(bold=True)
+    ws[f'{govt_letter}1'].alignment = Alignment(horizontal='right')
+    ws[f'{govt_letter}1'].border = thin_border
+    ws[f'{govt_letter}1'].fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    
+    ws[f'{govt_letter}2'] = f"=({govt_letter}{govt_row}-{quoted_letter}{quoted_row})/{govt_letter}{govt_row}*100"
+    ws[f'{govt_letter}2'].number_format = '0.00"%"'
+    ws[f'{govt_letter}2'].font = Font(bold=True, size=12)
+    ws[f'{govt_letter}2'].alignment = Alignment(horizontal='right')
+    ws[f'{govt_letter}2'].border = thin_border
+    ws[f'{govt_letter}2'].fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+    
+    # Save to BytesIO
+    excel_buffer = io.BytesIO()
+    wb.save(excel_buffer)
+    excel_buffer.seek(0)
+    return excel_buffer
+
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
+@app.route('/', methods=['GET'])
+def home():
+    """API Documentation"""
+    return jsonify({
+        "name": "PDF Table Extractor API - FIXED",
+        "version": "2.1",
+        "status": "running",
+        "fixes": [
+            "Sr. No. no longer merges into descriptions",
+            "Better continuation row detection",
+            "Improved serial number validation"
+        ],
+        "endpoints": {
+            "health": {
+                "path": "/api/health",
+                "method": "GET",
+                "description": "Check API health status"
+            },
+            "extract": {
+                "path": "/api/extract",
+                "method": "POST",
+                "description": "Extract tables from PDF",
+                "parameters": {
+                    "file": "PDF file (multipart/form-data)",
+                    "pages": "Pages to extract (default: 'all', or '1,2,3')",
+                    "name": "Document name (optional)"
+                },
+                "headers": {
+                    "X-API-Key": "Your API key (if enabled)"
+                }
+            },
+            "recalculate": {
+                "path": "/api/recalculate",
+                "method": "POST",
+                "description": "Recalculate totals for edited data",
+                "body": {
+                    "data": "Array of row objects"
+                }
+            },
+            "download": {
+                "path": "/api/download",
+                "method": "POST",
+                "description": "Generate Excel file from data",
+                "body": {
+                    "data": "Array of row objects",
+                    "name": "Filename (optional)"
+                }
+            }
+        },
+        "rate_limits": {
+            "per_day": 500,
+            "per_hour": 100
+        }
+    }), 200
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "version": "2.1",
+        "timestamp": datetime.utcnow().isoformat(),
+        "api_key_required": ENABLE_API_KEY
+    }), 200
+
+@app.route('/api/extract', methods=['POST', 'OPTIONS'])
+@limiter.limit("50 per hour")
+@require_api_key
+def extract_pdf():
+    """Extract tables from PDF"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    request_id = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        
+        file = request.files['file']
+        
+        # Validate file
+        is_valid, error_msg = validate_pdf_file(file)
+        if not is_valid:
+            return jsonify({"error": error_msg}), 400
+        
+        pages = request.form.get('pages', 'all')
+        name = request.form.get('name', secure_filename(file.filename))
+        
+        logger.info(f"[{request_id}] Processing: {file.filename}, Pages: {pages}")
+        
+        pdf_bytes = file.read()
+        
+        # Extract tables
+        extracted_dfs, error, method = extract_pdf_tables(pdf_bytes, pages)
+        if error:
+            logger.error(f"[{request_id}] Extraction error: {error}")
+            return jsonify({"error": error}), 400
+        
+        # Process tables
+        final_df, process_error = process_extracted_tables(extracted_dfs)
+        if process_error:
+            logger.error(f"[{request_id}] Processing error: {process_error}")
+            return jsonify({"error": process_error}), 400
+        
+        # Calculate totals
+        govt_total = final_df["Govt Rate - Total"].sum() if "Govt Rate - Total" in final_df.columns else 0
+        quoted_total = final_df["Quoted Rate - Total"].sum() if "Quoted Rate - Total" in final_df.columns else 0
+        
+        logger.info(f"[{request_id}] Success: {len(final_df)} rows, Govt: {govt_total:.2f}, Quoted: {quoted_total:.2f}")
+        
+        # Clean dataframe for JSON response
+        response_df = clean_dataframe_for_json(final_df)
+        
+        return jsonify({
+            "success": True,
+            "request_id": request_id,
+            "data": response_df.to_dict(orient='records'),
+            "summary": {
+                "total_rows": len(final_df),
+                "govt_total": float(govt_total),
+                "quoted_total": float(quoted_total),
+                "extraction_method": method,
+                "filename": name
+            },
+            "columns": FINAL_COLUMN_ORDER
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"[{request_id}] Unexpected error: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({
+            "error": f"Extraction failed: {str(e)}",
+            "request_id": request_id
+        }), 500
+
+@app.route('/api/recalculate', methods=['POST', 'OPTIONS'])
+@limiter.limit("100 per hour")
+@require_api_key
+def recalculate():
+    """Recalculate totals for edited data"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    try:
+        data = request.get_json()
+        if not data or 'data' not in data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        df = pd.DataFrame(data['data'])
+        recalculated_df = recalculate_editor_df_values(df)
+        
+        govt_total = recalculated_df["Govt Rate - Total"].sum() if "Govt Rate - Total" in recalculated_df.columns else 0
+        quoted_total = recalculated_df["Quoted Rate - Total"].sum() if "Quoted Rate - Total" in recalculated_df.columns else 0
+        
+        response_df = clean_dataframe_for_json(recalculated_df)
+        
+        return jsonify({
+            "success": True,
+            "data": response_df.to_dict(orient='records'),
+            "summary": {
+                "total_rows": len(recalculated_df),
+                "govt_total": float(govt_total),
+                "quoted_total": float(quoted_total)
+            }
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Recalculation error: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": f"Recalculation failed: {str(e)}"}), 500
+
+@app.route('/api/download', methods=['POST', 'OPTIONS'])
+@app.route('/api/download-excel', methods=['POST', 'OPTIONS'])
+@limiter.limit("50 per hour")
+@require_api_key
+def download_excel():
+    """Generate Excel file from data"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    try:
+        data = request.get_json()
+        if not data or 'data' not in data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        df = pd.DataFrame(data['data'])
+        name = data.get('name', 'extracted_data')
+        
+        # Sanitize filename
+        name = secure_filename(name)
+        if not name.endswith('.xlsx'):
+            name = name.replace('.xlsx', '') + '.xlsx'
+        
+        excel_buffer = generate_excel_from_df(df, name)
+        
+        return send_file(
+            excel_buffer,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=name
+        )
+    
+    except Exception as e:
+        logger.error(f"Excel generation error: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": f"Excel generation failed: {str(e)}"}), 500
+
+# ============================================================================
+# ERROR HANDLERS
+# ============================================================================
+
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return jsonify({
+        "error": "File too large",
+        "max_size": f"{app.config['MAX_CONTENT_LENGTH'] // (1024*1024)}MB"
+    }), 413
+
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    return jsonify({
+        "error": "Rate limit exceeded",
+        "message": str(e.description)
+    }), 429
+
+@app.errorhandler(500)
+def internal_server_error(error):
+    logger.error(f"Internal server error: {str(error)}")
+    return jsonify({
+        "error": "Internal server error",
+        "message": "Something went wrong on our end"
+    }), 500
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+if __name__ == '__main__':
+    print("=" * 80)
+    print("🚀 PDF EXTRACTOR API v2.1 - FIXED VERSION")
+    print("=" * 80)
+    print("✨ FIXES APPLIED:")
+    print("  • Sr. No. no longer merges into descriptions")
+    print("  • Better continuation row detection")
+    print("  • Improved serial number validation (1-200, Roman numerals)")
+    print("  • Enhanced fallback header detection")
+    print("=" * 80)
+    print(f"📝 API Documentation: http://localhost:{PORT}/")
+    print(f"📝 Health check: http://localhost:{PORT}/api/health")
+    print(f"📄 Extract endpoint: http://localhost:{PORT}/api/extract")
+    print(f"🔄 Recalculate endpoint: http://localhost:{PORT}/api/recalculate")
+    print(f"⬇️  Download endpoint: http://localhost:{PORT}/api/download")
+    print("=" * 80)
+    print("\n✨ PRODUCTION FEATURES:")
+    print("  • Rate limiting: 500/day, 100/hour per IP")
+    print("  • Concurrent request handling")
+    print("  • Comprehensive logging to logs/pdf_extractor.log")
+    print("  • API key authentication (optional)")
+    print("  • Robust error handling")
+    print("  • File validation and security")
+    print("\n🔐 SECURITY:")
+    if ENABLE_API_KEY:
+        print(f"  • API Key: ENABLED")
+        print(f"  • Send requests with header: X-API-Key: {API_KEY}")
+    else:
+        print(f"  • API Key: DISABLED (set ENABLE_API_KEY=true to enable)")
+    print("\n🚀 FOR PRODUCTION DEPLOYMENT:")
+    print("  1. Install gunicorn: pip install gunicorn")
+    print("  2. Run with: gunicorn -w 4 -b 0.0.0.0:5000 --timeout 300 app:app")
+    print("  3. Set environment variables:")
+    print("     - ENABLE_API_KEY=true")
+    print("     - API_KEY=your-secure-random-key")
+    print("     - ALLOWED_ORIGINS=https://yourdomain.com")
+    print("  4. Use a reverse proxy (nginx) for SSL/HTTPS")
+    print("  5. Set up systemd service for auto-restart")
+    print("\n📚 API USAGE EXAMPLE:")
+    print("""
+    curl -X POST http://localhost:5000/api/extract \\
+      -H "X-API-Key: your-api-key" \\
+      -F "file=@document.pdf" \\
+      -F "pages=all"
+    """)
+    print("=" * 80 + "\n")
+    
+    # Development server (use gunicorn for production)
+    app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
